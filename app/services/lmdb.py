@@ -1,7 +1,7 @@
 import hashlib
 import re
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -9,78 +9,25 @@ import lmdb
 import orjson
 from loguru import logger
 
-from ..models import ContentItem, ConversationInStore, Message
+from ..models import ConversationInStore, Message
 from ..utils import g_config
-from ..utils.helper import extract_tool_calls, remove_tool_call_blocks
 from ..utils.singleton import Singleton
 
 
 def _hash_message(message: Message) -> str:
-    """Generate a consistent hash for a single message focusing ONLY on logic/content, ignoring technical IDs."""
-    core_data = {
-        "role": message.role,
-        "name": message.name,
-    }
-
-    # Normalize content: strip, handle empty/None, and list-of-text items
-    content = message.content
-    if not content:
-        core_data["content"] = None
-    elif isinstance(content, str):
-        # Normalize line endings and strip whitespace
-        normalized = content.replace("\r\n", "\n").strip()
-        core_data["content"] = normalized if normalized else None
-    elif isinstance(content, list):
-        text_parts = []
-        for item in content:
-            if isinstance(item, ContentItem) and item.type == "text":
-                text_parts.append(item.text or "")
-            elif isinstance(item, dict) and item.get("type") == "text":
-                text_parts.append(item.get("text") or "")
-            else:
-                # If it contains non-text (images/files), keep the full list for hashing
-                text_parts = None
-                break
-
-        if text_parts is not None:
-            # Normalize each part but keep them as a list to preserve boundaries and avoid collisions
-            normalized_parts = [p.replace("\r\n", "\n") for p in text_parts]
-            core_data["content"] = normalized_parts if normalized_parts else None
-        else:
-            core_data["content"] = message.model_dump(mode="json")["content"]
-
-    # Normalize tool_calls: Focus ONLY on function name and arguments
-    if message.tool_calls:
-        calls_data = []
-        for tc in message.tool_calls:
-            args = tc.function.arguments or "{}"
-            try:
-                parsed = orjson.loads(args)
-                canon_args = orjson.dumps(parsed, option=orjson.OPT_SORT_KEYS).decode("utf-8")
-            except orjson.JSONDecodeError:
-                canon_args = args
-
-            calls_data.append(
-                {
-                    "name": tc.function.name,
-                    "arguments": canon_args,
-                }
-            )
-        # Sort calls to be order-independent
-        calls_data.sort(key=lambda x: (x["name"], x["arguments"]))
-        core_data["tool_calls"] = calls_data
-    else:
-        core_data["tool_calls"] = None
-
-    message_bytes = orjson.dumps(core_data, option=orjson.OPT_SORT_KEYS)
+    """Generate a hash for a single message."""
+    # Convert message to dict and sort keys for consistent hashing
+    message_dict = message.model_dump(mode="json")
+    message_bytes = orjson.dumps(message_dict, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(message_bytes).hexdigest()
 
 
 def _hash_conversation(client_id: str, model: str, messages: List[Message]) -> str:
-    """Generate a hash for a list of messages and model name, tied to a specific client_id."""
+    """Generate a hash for a list of messages and client id."""
+    # Create a combined hash from all individual message hashes
     combined_hash = hashlib.sha256()
-    combined_hash.update((client_id or "").encode("utf-8"))
-    combined_hash.update((model or "").encode("utf-8"))
+    combined_hash.update(client_id.encode("utf-8"))
+    combined_hash.update(model.encode("utf-8"))
     for message in messages:
         message_hash = _hash_message(message)
         combined_hash.update(message_hash.encode("utf-8"))
@@ -92,31 +39,22 @@ class LMDBConversationStore(metaclass=Singleton):
 
     HASH_LOOKUP_PREFIX = "hash:"
 
-    def __init__(
-        self,
-        db_path: Optional[str] = None,
-        max_db_size: Optional[int] = None,
-        retention_days: Optional[int] = None,
-    ):
+    def __init__(self, db_path: Optional[str] = None, max_db_size: Optional[int] = None):
         """
         Initialize LMDB store.
 
         Args:
             db_path: Path to LMDB database directory
-            max_db_size: Maximum database size in bytes (default: 256 MB)
-            retention_days: Number of days to retain conversations (default: 14, 0 disables cleanup)
+            max_db_size: Maximum database size in bytes (default: 128MB)
         """
 
         if db_path is None:
             db_path = g_config.storage.path
         if max_db_size is None:
             max_db_size = g_config.storage.max_size
-        if retention_days is None:
-            retention_days = g_config.storage.retention_days
 
         self.db_path: Path = Path(db_path)
         self.max_db_size: int = max_db_size
-        self.retention_days: int = max(0, int(retention_days))
         self._env: lmdb.Environment | None = None
 
         self._ensure_db_path()
@@ -263,13 +201,12 @@ class LMDBConversationStore(metaclass=Singleton):
         return None
 
     def _find_by_message_list(
-        self,
-        model: str,
-        messages: List[Message],
+        self, model: str, messages: List[Message]
     ) -> Optional[ConversationInStore]:
         """Internal find implementation based on a message list."""
         for c in g_config.gemini.clients:
             message_hash = _hash_conversation(c.id, model, messages)
+
             key = f"{self.HASH_LOOKUP_PREFIX}{message_hash}"
             try:
                 with self._get_transaction(write=False) as txn:
@@ -373,78 +310,6 @@ class LMDBConversationStore(metaclass=Singleton):
 
         return keys
 
-    def cleanup_expired(self, retention_days: Optional[int] = None) -> int:
-        """
-        Delete conversations older than the given retention period.
-
-        Args:
-            retention_days: Optional override for retention period in days.
-
-        Returns:
-            Number of conversations removed.
-        """
-        retention_value = (
-            self.retention_days if retention_days is None else max(0, int(retention_days))
-        )
-        if retention_value <= 0:
-            logger.debug("Retention cleanup skipped because retention is disabled.")
-            return 0
-
-        cutoff = datetime.now() - timedelta(days=retention_value)
-        expired_entries: list[tuple[str, ConversationInStore]] = []
-
-        try:
-            with self._get_transaction(write=False) as txn:
-                cursor = txn.cursor()
-
-                for key_bytes, value_bytes in cursor:
-                    key_str = key_bytes.decode("utf-8")
-                    if key_str.startswith(self.HASH_LOOKUP_PREFIX):
-                        continue
-
-                    try:
-                        storage_data = orjson.loads(value_bytes)  # type: ignore[arg-type]
-                        conv = ConversationInStore.model_validate(storage_data)
-                    except Exception as exc:
-                        logger.warning(f"Failed to decode record for key {key_str}: {exc}")
-                        continue
-
-                    timestamp = conv.created_at or conv.updated_at
-                    if not timestamp:
-                        continue
-
-                    if timestamp < cutoff:
-                        expired_entries.append((key_str, conv))
-        except Exception as exc:
-            logger.error(f"Failed to scan LMDB for retention cleanup: {exc}")
-            raise
-
-        if not expired_entries:
-            return 0
-
-        removed = 0
-        try:
-            with self._get_transaction(write=True) as txn:
-                for key_str, conv in expired_entries:
-                    key_bytes = key_str.encode("utf-8")
-                    if not txn.delete(key_bytes):
-                        continue
-
-                    message_hash = _hash_conversation(conv.client_id, conv.model, conv.messages)
-                    if message_hash and key_str != message_hash:
-                        txn.delete(f"{self.HASH_LOOKUP_PREFIX}{message_hash}".encode("utf-8"))
-                    removed += 1
-        except Exception as exc:
-            logger.error(f"Failed to delete expired conversations: {exc}")
-            raise
-
-        if removed:
-            logger.info(
-                f"LMDB retention cleanup removed {removed} conversation(s) older than {cutoff.isoformat()}."
-            )
-
-        return removed
-
     def stats(self) -> Dict[str, Any]:
         """
         Get database statistics.
@@ -476,78 +341,25 @@ class LMDBConversationStore(metaclass=Singleton):
     @staticmethod
     def remove_think_tags(text: str) -> str:
         """
-        Remove all <think>...</think> tags and strip whitespace.
+        Remove <think>...</think> tags at the start of text and strip whitespace.
         """
-        # Remove all think blocks anywhere in the text
-        cleaned_content = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        cleaned_content = re.sub(r"^(\s*<think>.*?</think>\n?)", "", text, flags=re.DOTALL)
         return cleaned_content.strip()
 
     @staticmethod
     def sanitize_assistant_messages(messages: list[Message]) -> list[Message]:
         """
-        Create a new list of messages with assistant content cleaned of <think> tags
-        and system hints/tool call blocks. This is used for both storing and
-        searching chat history to ensure consistency.
-
-        If a message has no tool_calls but contains tool call XML blocks in its
-        content, they will be extracted and moved to the tool_calls field.
+        Create a new list of messages with assistant content cleaned of <think> tags.
+        This is useful for store the chat history.
         """
         cleaned_messages = []
         for msg in messages:
-            if msg.role == "assistant":
-                if isinstance(msg.content, str):
-                    text = LMDBConversationStore.remove_think_tags(msg.content)
-                    tool_calls = msg.tool_calls
-                    if not tool_calls:
-                        text, tool_calls = extract_tool_calls(text)
-                    else:
-                        text = remove_tool_call_blocks(text).strip()
-
-                    normalized_content = text.strip()
-
-                    if normalized_content != msg.content or tool_calls != msg.tool_calls:
-                        cleaned_msg = msg.model_copy(
-                            update={
-                                "content": normalized_content or None,
-                                "tool_calls": tool_calls or None,
-                            }
-                        )
-                        cleaned_messages.append(cleaned_msg)
-                    else:
-                        cleaned_messages.append(msg)
-                elif isinstance(msg.content, list):
-                    new_content = []
-                    all_extracted_calls = list(msg.tool_calls or [])
-                    changed = False
-
-                    for item in msg.content:
-                        if isinstance(item, ContentItem) and item.type == "text" and item.text:
-                            text = LMDBConversationStore.remove_think_tags(item.text)
-
-                            if not msg.tool_calls:
-                                text, extracted = extract_tool_calls(text)
-                                if extracted:
-                                    all_extracted_calls.extend(extracted)
-                                    changed = True
-                            else:
-                                text = remove_tool_call_blocks(text).strip()
-
-                            if text != item.text:
-                                changed = True
-                                item = item.model_copy(update={"text": text.strip() or None})
-                        new_content.append(item)
-
-                    if changed:
-                        cleaned_messages.append(
-                            msg.model_copy(
-                                update={
-                                    "content": new_content,
-                                    "tool_calls": all_extracted_calls or None,
-                                }
-                            )
-                        )
-                    else:
-                        cleaned_messages.append(msg)
+            if msg.role == "assistant" and isinstance(msg.content, str):
+                normalized_content = LMDBConversationStore.remove_think_tags(msg.content)
+                # Only create a new object if content actually changed
+                if normalized_content != msg.content:
+                    cleaned_msg = Message(role=msg.role, content=normalized_content, name=msg.name)
+                    cleaned_messages.append(cleaned_msg)
                 else:
                     cleaned_messages.append(msg)
             else:
