@@ -218,6 +218,7 @@ class GeminiClientPool(metaclass=Singleton):
                         client_id=c.id,
                         secure_1psid=c.secure_1psid,
                         secure_1psidts=c.secure_1psidts,
+                        proxy=c.proxy,
                     )
                     client.pro = getattr(c, "pro", False)
                 else:
@@ -234,6 +235,7 @@ class GeminiClientPool(metaclass=Singleton):
                             client_id=c.id,
                             secure_1psid=secure_1psid,
                             secure_1psidts=secure_1psidts,
+                            proxy=c.proxy,
                         )
                         client.pro = getattr(c, "pro", False)
                     else:
@@ -242,12 +244,14 @@ class GeminiClientPool(metaclass=Singleton):
                             client_id=c.id,
                             secure_1psid=c.secure_1psid,
                             secure_1psidts=c.secure_1psidts,
+                            proxy=c.proxy,
                         )
                         client.pro = getattr(c, "pro", False)
                 
                 self._clients.append(client)
                 self._id_map[c.id] = client
                 self._round_robin.append(client)
+                self._restart_locks[c.id] = asyncio.Lock()
                 
                 # Initialize availability from accounts.json if present
                 try:
@@ -290,6 +294,7 @@ class GeminiClientPool(metaclass=Singleton):
         logger.info(
             f"  Non-PRO clients: {len(self._non_pro_clients)} ({', '.join([c.id for c in self._non_pro_clients]) if self._non_pro_clients else 'none'})"
         )
+
     def _load_client_init_text(self) -> str:
         """Load client initialization text for new sessions"""
         try:
@@ -389,18 +394,29 @@ class GeminiClientPool(metaclass=Singleton):
 
     async def init(self) -> None:
         """Initialize all clients in the pool."""
+        success_count = 0
         for client in self._clients:
-            if not client.running:
-                await client.init(
-                    timeout=g_config.gemini.timeout,
-                    auto_refresh=g_config.gemini.auto_refresh,
-                    verbose=g_config.gemini.verbose,
-                    refresh_interval=g_config.gemini.refresh_interval,
-                )
+            if not client.running():
+                try:
+                    await client.init(
+                        timeout=g_config.gemini.timeout,
+                        watchdog_timeout=g_config.gemini.watchdog_timeout,
+                        auto_refresh=g_config.gemini.auto_refresh,
+                        verbose=g_config.gemini.verbose,
+                        refresh_interval=g_config.gemini.refresh_interval,
+                    )
+                except Exception:
+                    logger.exception(f"Failed to initialize client {client.id}")
 
-    def acquire(self, client_id: Optional[str] = None, prefer_pro: bool = True) -> GeminiClientWrapper:
+            if client.running():
+                success_count += 1
+
+        if success_count == 0:
+            raise RuntimeError("Failed to initialize any Gemini clients")
+
+    async def acquire(self, client_id: Optional[str] = None, prefer_pro: bool = True) -> GeminiClientWrapper:
         """
-        Return a client by id or using priority-based round-robin.
+        Return a healthy client by id or using priority-based round-robin.
         
         Priority logic:
         - If prefer_pro=True (default): Use PRO clients first, fallback to non-PRO only if no PRO available
@@ -421,133 +437,90 @@ class GeminiClientPool(metaclass=Singleton):
             if not self._is_client_available_now(client):
                 reason = getattr(client, 'unavailable_reason', 'unknown')
                 raise ValueError(f"Client {client_id} is currently unavailable: {reason}")
-            is_pro = getattr(client, 'pro', False) if hasattr(client, 'pro') else False
-            pro_status = "PRO" if is_pro else "non-PRO"
-            logger.info(f"✅ Using specified client: {client.id} ({pro_status})")
-            return client
+            
+            if await self._ensure_client_ready(client):
+                is_pro = getattr(client, 'pro', False) if hasattr(client, 'pro') else False
+                pro_status = "PRO" if is_pro else "non-PRO"
+                logger.debug(f"✅ Using specified client: {client.id} ({pro_status})")
+                return client
+            raise RuntimeError(f"Gemini client {client_id} is not running and could not be restarted")
 
-        # ✅ NEW: PRO priority logic with availability checking
+        # ✅ PRO priority logic with availability checking
         if prefer_pro:
-            # Try PRO clients first - loop through all PRO clients until we find an available one
+            # Try PRO clients first
             max_pro_attempts = len(self._pro_clients)
             pro_attempts = 0
-            
             while pro_attempts < max_pro_attempts and self._pro_round_robin:
                 client = self._pro_round_robin[0]
-                self._pro_round_robin.rotate(-1)  # Rotate even if unavailable (for round-robin)
+                self._pro_round_robin.rotate(-1)
+                pro_attempts += 1
                 
                 if self._is_client_available_now(client):
-                    logger.info(f"✅ Using PRO client: {client.id} (PRO pool: {len(self._pro_round_robin)} remaining, Non-PRO pool: {len(self._non_pro_round_robin)} available)")
-                    return client
-                else:
-                    pro_attempts += 1
-                    reason = getattr(client, 'unavailable_reason', 'unknown')
-                    logger.debug(f"⏭️  Skipping unavailable PRO client {client.id} (reason: {reason})")
+                    if await self._ensure_client_ready(client):
+                        logger.debug(f"✅ Using PRO client: {client.id}")
+                        return client
             
-            # Fallback to non-PRO only if no PRO clients available
+            # Fallback to non-PRO
             max_non_pro_attempts = len(self._non_pro_clients)
             non_pro_attempts = 0
-            
             while non_pro_attempts < max_non_pro_attempts and self._non_pro_round_robin:
                 client = self._non_pro_round_robin[0]
                 self._non_pro_round_robin.rotate(-1)
+                non_pro_attempts += 1
                 
                 if self._is_client_available_now(client):
-                    logger.info(f"⚠️ Using non-PRO client: {client.id} (no available PRO clients, Non-PRO pool: {len(self._non_pro_round_robin)} remaining)")
-                    return client
-                else:
-                    non_pro_attempts += 1
-                    reason = getattr(client, 'unavailable_reason', 'unknown')
-                    logger.debug(f"⏭️  Skipping unavailable non-PRO client {client.id} (reason: {reason})")
-        
-        # Fallback to original round-robin if prefer_pro=False or both pools empty
-        if not self._round_robin:
-            # If round_robin is empty, try to get any available client
-            if self._clients:
-                logger.warning(f"Round robin deque is empty, checking {len(self._clients)} clients for ANY availability...")
-                
-                # ✅ FIX: Iterate through all clients and find one that is ACTUALLY available
-                for client in self._clients:
-                    if self._is_client_available_now(client):
-                        logger.info(f"✅ Found available fallback client: {client.id}")
+                    if await self._ensure_client_ready(client):
+                        logger.debug(f"⚠️ Using non-PRO client: {client.id} (no PRO available)")
                         return client
-                
-                # If we get here, NO clients are available
-                logger.error("❌ ALL clients are currently unavailable!")
-                # Attempt to reinitialize as a last ditch effort
-                try:
-                    self._reinitialize_pool()
-                     # Check again after reinit
-                    if self._clients:
-                        for client in self._clients:
-                             if self._is_client_available_now(client):
-                                logger.info(f"✅ Found available client after reinit: {client.id}")
-                                return client
-                except Exception as e:
-                    logger.error(f"Failed to reinitialize pool: {e}")
-                
-                 # If still no clients, verify we can't proceed
-                raise ValueError("No clients available in pool (all marked as unavailable)")
-            else:
-                logger.error("No clients available in pool - attempting to reinitialize")
-                # Try to reinitialize the pool
-                try:
-                    self._reinitialize_pool()
-                    if self._clients:
-                         # Check availability again
-                         for client in self._clients:
-                             if self._is_client_available_now(client):
-                                logger.info(f"Successfully reinitialized pool and found client: {client.id}")
-                                return client
-                except Exception as e:
-                    logger.error(f"Failed to reinitialize pool: {e}")
-                except Exception as e:
-                    logger.error(f"Failed to reinitialize pool: {e}")
-                
-                logger.error("No clients available in pool after reinitialization attempt")
-                
-                # Last resort: create a default client
-                logger.warning("Creating emergency default client...")
-                try:
-                    emergency_client = GeminiClientWrapper(
-                        client_id="emergency-client",
-                        secure_1psid=g_config.gemini.clients[0].secure_1psid if g_config.gemini.clients else "",
-                        secure_1psidts=g_config.gemini.clients[0].secure_1psidts if g_config.gemini.clients else "",
-                    )
-                    self._clients.append(emergency_client)
-                    self._id_map["emergency-client"] = emergency_client
-                    self._round_robin.append(emergency_client)
-                    logger.info("Emergency client created successfully")
-                    return emergency_client
-                except Exception as e:
-                    logger.error(f"Failed to create emergency client: {e}")
-                    raise ValueError("No clients available in pool and emergency client creation failed")
+        
+        # Fallback to general round-robin (original behavior)
+        if not self._round_robin:
+            try:
+                self._reinitialize_pool()
+            except Exception as e:
+                logger.error(f"Failed to reinitialize pool: {e}")
         
         if not self._round_robin:
-             logger.error("❌ Master round-robin pool is empty (this should not happen!)")
-             raise ValueError("No clients available in pool")
+             raise ValueError("No Gemini clients are currently available")
 
-        # ✅ FIX: Iterate through master round robin to find first AVAILABLE client
-        # self._round_robin contains ALL clients, so we must filter for availability
         attempts = 0
         max_attempts = len(self._round_robin)
-        
         while attempts < max_attempts:
             client = self._round_robin[0]
-            self._round_robin.rotate(-1) # Rotate for next time
+            self._round_robin.rotate(-1)
             attempts += 1
             
             if self._is_client_available_now(client):
-                is_pro = getattr(client, 'pro', False) if hasattr(client, 'pro') else False
-                pro_status = "PRO" if is_pro else "non-PRO"
-                logger.info(f"✅ Using client (round-robin fallback): {client.id} ({pro_status}, pool: {len(self._round_robin)} total)")
-                return client
-            
-            # If not available, we just rotated it to the back and try the next one
-            
-        # If we get here, we rotated through the ENTIRE list and found nothing
-        logger.error("❌ Looped through entire master round_robin and found NO available clients!")
-        raise ValueError("No clients available in pool (all marked as unavailable)")
+                if await self._ensure_client_ready(client):
+                    return client
+
+        raise ValueError("No Gemini clients are currently available")
+
+    async def _ensure_client_ready(self, client: GeminiClientWrapper) -> bool:
+        """Make sure the client is running, attempting a restart if needed."""
+        if client.running():
+            return True
+
+        lock = self._restart_locks.get(client.id)
+        if lock is None:
+            return False
+
+        async with lock:
+            if client.running():
+                return True
+
+            try:
+                await client.init(
+                    timeout=g_config.gemini.timeout,
+                    watchdog_timeout=g_config.gemini.watchdog_timeout,
+                    auto_refresh=g_config.gemini.auto_refresh,
+                    verbose=g_config.gemini.verbose,
+                    refresh_interval=g_config.gemini.refresh_interval,
+                )
+                return client.running()
+            except Exception:
+                logger.exception(f"Failed to restart client {client.id}")
+                return False
 
     def _is_client_available_now(self, client: GeminiClientWrapper) -> bool:
         """Check if client is currently available (considering time-based availability)."""
