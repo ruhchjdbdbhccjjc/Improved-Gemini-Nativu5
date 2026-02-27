@@ -1,0 +1,184 @@
+# Act as a Project Lead observing the Universal Smart Sync Protocol (v2.5)
+
+## 0. Write Protection Protocol (CRITICAL)
+
+- **Constraint**: You are FORBIDDEN from modifying `.cursorrules` or `.config/**` unless the User explicitly asks to "Update Protocol" or "Config".
+- **Reason**: These files define your brain. Silent changes here cause permanent behavioral drift.
+- **Action**: If you think a rule is bad, **PROPOSE** the change in chat first. NEVER auto-fix.
+
+## Rule Hierarchy
+
+1. **CHECK**: If `./docs/project_rules.md` exists, **FOLLOW** its instructions first. (Local overrides).
+2. **SCAN**: Check `./.agent/rules/instructions.md` for project-specific behavioral guardrails (e.g., Dark Mode requirements).
+3. **LOAD**: Use the following Global Protocol as the foundation for documentation, cleanup, and Agent behavior.
+
+---
+
+## 1. Documentation (Deep Merge & Link)
+
+Update the permanent library in `./docs/` preserving structure and technical detail.
+
+### A. Core Library
+
+- **Action**: Check `./docs/FEATURES.md`, `./docs/KNOWN_ISSUES.md`, and `./docs/ARCHITECTURE.md`. Create these if they do not exist.
+- **Goal**: Maintain a searchable, high-level map of the entire system.
+- **Architecture Logic (Structure Update)**:
+  - **Trigger**: IF new source files are created (e.g., `src/modules/new_logic.rs`), update `./docs/ARCHITECTURE.md`.
+  - **Action**: Insert the new file into the relevant component section (e.g., under "Input Processing").
+  - **Details**: Briefly explain its **Purpose** and **Usage** (who depends on it).
+  - **Requirement**: The file path MUST be a clickable link. **If referencing a specific function, use the format:** `[Function Name](../path/to/file.rs#L123)`.
+    - _Note_: Explicitly naming the function ensures searchability if line numbers shift.
+- **Constraint**: Do NOT create generic "daily summaries". Use descriptive names.
+
+### B. New Feature Logic
+
+- **Location**: `./docs/features/`.
+- **Trigger**: IF a new feature is added, create a dedicated detail file (e.g., `./docs/features/smart_sidebar_details.md`).
+- **Templates**: READ `./docs/templates/feature_template.md` for Mermaid rules and disclosure requirements.
+- **Requirement (Visuals)**: MUST include a **Function Logic Map** as **ASCII art**. Avoid Mermaid diagrams to prevent parse errors.
+- **Requirement (Links)**:
+  - Sub-docs in `./docs/features/` MUST use `../../` to reach the root and include the function/identifier (e.g., `[MyFunc](../../src/main.ts#L100)`).
+  - This ensures links are **clickable** in Cursor/VS Code.
+- **Merge**: Add a brief summary in `./docs/FEATURES.md` and link to the detail file.
+
+### C. Bug Fix Logic
+
+- **Location**: `./docs/issues/`.
+- **Trigger**: IF a bug is fixed, create a retrospective (e.g., `./docs/issues/audio_fix.md`).
+- **Templates**: READ `./docs/templates/issue_template.md`.
+- **Requirement**: Explain **Root Cause** (Why), **Fix** (How), and list specific **File Names & Functions** modified.
+- **Code Links**: Link to the specific logic blocks changed using format `[Function Name](../../path/to/file.ext#L30-L50)`.
+- **Merge**: Update `./docs/KNOWN_ISSUES.md` with the resolution status and local link.
+
+---
+
+## 2. Agent Folder & Workspace Management (.agent)
+
+The `./.agent` folder is the brain of the session. Handle it with care.
+
+- **Preserve**:
+  - `./.agent/workflows/`: High-value repeatable logic.
+  - `./.agent/skills/`: Modular knowledge (links back to `./.config/skills`).
+- **Synchronization Rule (Workflow -> Registry & Docs)**:
+  - **Trigger**: IF a new workflow is created in `./.agent/workflows/NAME.md`.
+  - **Action 1**: Update `./.agent/workflows/master-workflow-registry.md` (The "Registry").
+  - **Action 2**: IF it is a **Special Project Workflow** (Local/Non-Default) AND explicitly mentioned by the User, run `./.agent/workflows/meta-update-workflow-docs.md` to update `docs/project_workflow_details.md` (The "Human Guide").
+  - **Reason**: The Registry tracks _existence_ (all workflows); the Guide explains _purpose_ (only local/special ones).
+
+- **Cleanup**:
+  - IF an implementation plan in `./.agent/` or `./.agent/plans/` is 100% completed and documented in `./docs/`, delete the plan file to reduce clutter.
+  - Delete temporary scratchpads or logs in `./.agent/` after the session goal is reached.
+
+---
+
+## 3. Cleanup & Preservation (Safety First)
+
+### A. Aggressive Cleanup
+
+- **Session Junk**: Delete generated assets (_.jpg, _.png, _.mp4, _.txt, \*.log) created during the session. (Check creation time).
+- **Session Docs**: Delete root-level walkthroughs or plans created during the session. **EXCEPT README.md**.
+- **Verify**: Ensure `examples/` and `tests/` are clean of generated outputs.
+
+### B. Preservation
+
+- **System Docs**: NEVER delete or reset `./docs/FEATURES.md`, `./docs/KNOWN_ISSUES.md`, or `./docs/ARCHITECTURE.md`.
+- **Code & Components**: KEEP all source code, config files, and project folder structures.
+- **Submodules**: NEVER modify files inside `.git/` or submodule metadata without explicit instruction.
+
+---
+
+## 4. Final Verification
+
+Before finishing a task:
+
+1. Ensure all logic maps in `./docs/` are **ASCII art** (no Mermaid).
+2. Verify all markdown links to source code use the correct relative path (`../../`) and functional labels (e.g. `[MyFunc](...)`) to be clickable.
+3. Check `./docs/ARCHITECTURE.md` for functional linking compliance if any new files/logic were created.
+
+---
+
+## 5. AI Code Generation & Modularity (Guardrails)
+
+To maintain high AI performance and code maintainability, follow these language-specific line limits:
+
+### A. Recommended File Line Limits
+
+- **TypeScript (.ts) / JavaScript (.js)**: Aim for < 400 lines (Logic modules).
+- **React/Solid (.tsx / .jsx)**: Aim for < 250 lines (UI Components).
+- **Python (.py)**: Aim for < 500 lines.
+- **Rust (.rs)**: Aim for < 600 lines.
+- **Styles (.css / .scss)**: Aim for < 500 lines.
+
+### B. Refactor-First Mandate
+
+- **Trigger**: IF an agent is asked to modify a file significantly exceeding these limits, it **SHOULD first propose a refactoring** to split the file into smaller, single-responsibility modules.
+- **Rationale**:
+  - **Context Window**: Large files consume excessive tokens.
+  - **Edit Accuracy**: Contextual "hallucinations" increase in files > 800 lines.
+  - **Generation Quality**: Prevents "lazy generation" where the AI skips essential code blocks.
+
+---
+
+## 6. Specialized Tech & Patterns
+
+- **Edge TTS**: Use `@andresaya/edge-tts` (v1.8.0) for speech synthesis.
+  - **Knowledge Source**: See [.agent/skills/edge-tts-mastery/SKILL.md](./.agent/skills/edge-tts-mastery/SKILL.md) for patterns.
+
+---
+
+## 7. Communication & Explanation (Clarity First)
+
+- **Lead with Logic**: You MUST lead with a logic map (ASCII art) for every explanation. This is a high-priority constraint to ensure clear communication of logic and dependencies.
+
+---
+
+## 8. Upstream & Patching Protocol (Dynamic)
+
+To maintain compatibility with external updates, strictly follow these boundaries:
+
+### A. Immutable Upstream (GitHub Sync-Safe)
+
+- **Goal**: Maintain 100% purity of external source code to allow seamless `git pull` or `git submodule update` from upstream repositories.
+- **Discovery Logic**:
+  1. **Submodule Check**: Any path listed in `.gitmodules` (like `gemini-api-source`).
+  2. **VCS Markers**: Any folder contains a `.git` directory or `.gitattributes` that is NOT the project root.
+  3. **Path Pattern**: Any folder with suffixes like `-source`, `-origin`, or `-upstream`.
+- **Constraint**: **NO LOCAL MODIFICATIONS**. AI must treat these as "Hardware Read-Only."
+
+### B. Local Project Logic
+
+- **Definition**: All code outside the "Immutable Upstream" zones (e.g., `app/`, `scripts/`, `run.py`).
+- **Interaction**: If the "Upstream" code needs a change, the AI **MUST** implement it in the **Local Project Logic** using the **Patching Pattern** (see below).
+
+### C. New Features (Injection over Modification)
+
+- **Pattern**: If a new feature is requested for the Upstream library:
+  1. **Logic Separation**: Create the logic in the **Local Project** (e.g., `app/services/new_feature.py`).
+  2. **Injection Hook**: Use the **Patching Pattern** to add a "Hook" (a new method or an override) to the Upstream class at runtime.
+- **Goal**: Ensure the feature "works as if it were in the main code" without actually polluting the upstream source files.
+- **Exception**: If a feature is so large that it _must_ reside in the upstream folder for architectural reasons, create a **New File** in that folder (e.g., `gemini-api-source/new_extension.py`) rather than editing existing files. This prevents merge conflicts during updates.
+
+- **Discovery**: Identify the project's monkey-patch, adapter, or bridge logic (e.g., `patches.py`, `adapter.ts`, `compat/`).
+- **Action**: All bug fixes, feature extensions, or compatibility adjustments for Upstream code MUST be implemented in these local patch files using monkey-patching or wrapper patterns.
+- **Rationale**: This allows the Upstream folder to be updated/re-synced from GitHub without losing local custom logic.
+
+---
+
+## 9. Integration & Synergies (The Logic Flow)
+
+Rules #5 and #8 work together in a unified workflow across ALL project languages:
+
+### A. The Lifecycle of a Change
+
+1. **Trigger (Rule #5)**: Detection that a function is too complex or a file is exceeding its language limit (e.g., 500 lines for Python, 400 for TS).
+2. **Constraint (Rule #8)**: Detection that the target code is **Upstream** (GitHub-synced).
+3. **Execution**:
+   - Instead of splitting the Upstream file (which breaks sync), the AI creates a **New Logic File** (Rule 8-C) in the local project.
+   - This new file MUST adhere to the **Line Limits** (Rule 5).
+   - The AI uses the **Patching Pattern** (Rule 8-B) to "inject" the clean, modular logic into the main application.
+
+### B. Language-Specific Implementation
+
+- **Python**: Use Monkey-Patching (reassigning methods at runtime).
+- **TypeScript/JavaScript**: Use Prototypes or Class Wrappers (Higher-Order Components/Functions).
+- **Rust**: Use Traits or Wrapper Structs (NewType pattern).
